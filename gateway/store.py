@@ -1,32 +1,85 @@
-"""Shared store client. Upstash Redis (REST) is the default target.
+"""In-memory session store for the gateway.
 
-Session schema (see CLAUDE.md):
-  {session_id, initiator, participants, duration_min, window,
-   inbound, proposed_time, confirmed}
-
-Sessions are keyed by `session:{session_id}`.
-A phone-number -> session_id index lets the /sms webhook route replies:
-  `participant:{number}` -> session_id
+Single-process. Lives only as long as the gateway. See CLAUDE.md session schema.
 """
+
+import secrets
+import threading
 
 
 class Store:
-    def __init__(self, url: str, token: str):
-        self.url = url
-        self.token = token
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict] = {}
+        self._handle_index: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def create_session(
+        self,
+        initiator: dict,
+        participants: list[dict],
+        duration_min: int,
+        window: dict,
+    ) -> str:
+        session_id = f"sess_{secrets.token_hex(4)}"
+        session = {
+            "session_id": session_id,
+            "initiator": initiator,
+            "participants": [
+                {
+                    "handle": p["handle"],
+                    "name": p.get("name", ""),
+                    "status": p.get("status", "pending"),
+                    "freebusy": [],
+                    "declared": None,
+                }
+                for p in participants
+            ],
+            "duration_min": duration_min,
+            "window": window,
+            "inbound": [],
+            "proposed_time": None,
+            "confirmed": False,
+            "seen_handles": [],
+        }
+        with self._lock:
+            self._sessions[session_id] = session
+            for p in participants:
+                self._handle_index[p["handle"]] = session_id
+            if initiator.get("handle"):
+                self._handle_index[initiator["handle"]] = session_id
+        return session_id
 
     def get_session(self, session_id: str) -> dict | None:
-        raise NotImplementedError
+        return self._sessions.get(session_id)
 
-    def put_session(self, session_id: str, session: dict) -> None:
-        raise NotImplementedError
+    def session_id_for_handle(self, phone: str) -> str | None:
+        return self._handle_index.get(phone)
 
-    def append_inbound(self, session_id: str, msg: dict) -> None:
-        """Append {from, body, ts} to session.inbound atomically if possible."""
-        raise NotImplementedError
+    def append_inbound(
+        self,
+        session_id: str,
+        message_handle: str,
+        from_: str,
+        body: str,
+        ts: str,
+    ) -> bool:
+        """Append an inbound message. Returns False if message_handle was already seen."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            if message_handle in session["seen_handles"]:
+                return False
+            session["seen_handles"].append(message_handle)
+            session["inbound"].append(
+                {
+                    "message_handle": message_handle,
+                    "from": from_,
+                    "body": body,
+                    "ts": ts,
+                }
+            )
+            return True
 
-    def session_id_for_number(self, number: str) -> str | None:
-        raise NotImplementedError
 
-    def bind_number(self, number: str, session_id: str) -> None:
-        raise NotImplementedError
+store = Store()
