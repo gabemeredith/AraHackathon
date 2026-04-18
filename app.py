@@ -1,77 +1,98 @@
 """Ara Automation: group-scheduler.
 
-Owns the agent loop, GCal free/busy + create_event, Gmail confirmations,
-and outbound SMS to non-initiator participants via the Twilio gateway.
-
-See docs/app.md for the full implementation brief.
+Text Ara's Linq number → Ara checks Google Calendar freebusy → proposes a time → books it.
+No Sendblue. No gateway. Pure Ara-native messaging.
 """
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ara_sdk as ara
 from ara_sdk import connectors, tool, secret
-
-GATEWAY_URL = secret("GATEWAY_URL")
-GATEWAY_KEY = secret("GATEWAY_KEY")
+from scheduling import check_participant_freebusy as _check_freebusy, propose_time as _propose_time
 
 
 SYSTEM_PROMPT = """\
-You are a group scheduler. The initiator texts you a request like
-"30 min next week with Alex and Jordan for coffee." Your job:
+You are a group scheduler. The initiator texts you via Ara's Linq number.
 
-1. Parse participants, duration, and window.
-2. For each participant: if their calendar is connected, read free/busy
-   silently. Otherwise call send_to_participant to ask via SMS.
-3. Poll read_inbound for replies. Merge declared availability.
-4. Call propose_time to find an intersection.
-5. Confirm with the initiator via linq. On "yes", create the GCal event
-   and send a confirmation email with a short agenda.
+Today's date is April 18, 2026 (Saturday). Window reference:
+- "next week" = Mon Apr 20 00:00 UTC → Sun Apr 27 00:00 UTC
+- "this week" = Apr 18 → Apr 20 00:00 UTC
 
-Never ask the initiator what you can infer. Never book without explicit
-confirmation. Keep SMS copy short and human.
+When the initiator says something like "schedule 30 min with caleb@cornell.edu next week":
+
+1. Parse the participant email(s), duration (default 30 min), and window.
+   If they give a name without an email, ask for the email in one short question.
+
+2. For each participant email, call check_participant_freebusy(email, window_start_iso, window_end_iso).
+   - On {"error": "no_token"}: reply "Calendar auth not set up — run python test_freebusy.py first."
+   - On {"error": "calendar_private"}: reply "Their calendar is private — ask them to share it with
+     your Google account, then try again."
+
+3. Combine all busy_blocks from all participants into one list.
+   Call propose_time(busy_blocks, window_start_iso, window_end_iso, duration_min).
+
+4. Reply to the initiator: "[Name] is free [start_human]. Book it?"
+   One sentence. Use the participant's first name.
+
+5. Wait for reply. On "yes" / "sure" / "yep" / "book it":
+   - Call connectors.google_calendar.create_event with all attendees.
+   - Call connectors.gmail.send_email with a 3-bullet agenda to everyone.
+   On "no" / "different time": call propose_time with skip_count incremented, re-ask.
+
+Rules:
+- Never ask for info you can infer from the message.
+- Never book without explicit confirmation.
+- Keep every reply to 1–2 sentences max.
+- If propose_time returns {"error": "no_slot_found"}: tell the initiator and ask if they
+  want to try a different week.
 """
 
 
 @tool
-def send_to_participant(number: str, body: str) -> dict:
-    """POST to Twilio gateway /send. Returns {"ok": bool, "sid": str}."""
-    raise NotImplementedError
+def check_participant_freebusy(
+    email: str, window_start_iso: str, window_end_iso: str
+) -> dict:
+    """Query Google Calendar free/busy for an email using saved OAuth token.
+    Returns {"busy": [{start, end}, ...], "email": email}
+    or {"error": "no_token" | "calendar_private"}.
+    """
+    # Inject Ara secret into env so scheduling.py can find creds when deployed
+    try:
+        creds_b64 = secret("GOOGLE_CREDS_B64")
+        if creds_b64:
+            os.environ["GOOGLE_CREDS_B64"] = creds_b64
+    except Exception:
+        pass
+    return _check_freebusy(email, window_start_iso, window_end_iso)
 
 
 @tool
-def read_inbound(since_ts: str | None = None) -> list[dict]:
-    """GET gateway /inbound. Returns [{from, body, ts}, ...]."""
-    raise NotImplementedError
-
-
-@tool
-def set_participant_status(number: str, status: str, data: dict | None = None) -> dict:
-    """Update participant state in the sandbox session."""
-    raise NotImplementedError
-
-
-@tool
-def get_session_state() -> dict:
-    """Return the merged session state (initiator, participants, inbound, ...)."""
-    raise NotImplementedError
-
-
-@tool
-def propose_time(window_iso: dict, duration_min: int) -> dict:
-    """Intersect free/busy + declared availability. Returns {start, end} or {error}."""
-    raise NotImplementedError
+def propose_time(
+    busy_blocks: list[dict],
+    window_start_iso: str,
+    window_end_iso: str,
+    duration_min: int = 30,
+    skip_count: int = 0,
+) -> dict:
+    """Find the Nth free slot across all participants' combined busy blocks.
+    skip_count=0 → first free slot, 1 → second, etc.
+    Searches Mon–Fri, 9am–6pm UTC.
+    Returns {start, end, start_human} or {error: no_slot_found}.
+    """
+    return _propose_time(busy_blocks, window_start_iso, window_end_iso, duration_min, skip_count)
 
 
 automation = ara.Automation(
     "group-scheduler",
     system_instructions=SYSTEM_PROMPT,
     tools=[
-        send_to_participant,
-        read_inbound,
-        set_participant_status,
-        get_session_state,
+        check_participant_freebusy,
         propose_time,
     ],
     skills=[
-        connectors.google_calendar.list_events,
         connectors.google_calendar.create_event,
         connectors.gmail.send_email,
     ],
