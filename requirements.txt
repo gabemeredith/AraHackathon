@@ -1,0 +1,8 @@
+ara-sdk
+fastapi
+uvicorn[standard]
+twilio
+httpx
+redis
+pydantic
+python-multipart
